@@ -107,7 +107,8 @@ def _decode_data_url(data_url: str) -> Tuple[bytes, str]:
         "image/webp": ".webp", "image/gif": ".gif",
         "audio/wav": ".wav", "audio/wave": ".wav", "audio/x-wav": ".wav",
         "audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/flac": ".flac",
-        "audio/ogg": ".ogg",
+        "audio/ogg": ".ogg", "audio/mp4": ".m4a", "audio/x-m4a": ".m4a",
+        "audio/aac": ".aac",
         "video/mp4": ".mp4", "video/quicktime": ".mov", "video/webm": ".webm",
     }
     mime = head[5:].split(";")[0].strip().lower()
@@ -294,6 +295,117 @@ def _user_texts_in_order(messages: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _hash_bytes(raw: bytes) -> str:
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def _hash_local_path(path: Path) -> str:
+    try:
+        if path.exists() and path.is_file():
+            return _hash_bytes(path.read_bytes())
+    except OSError:
+        pass
+    return _hash_bytes(str(path).encode("utf-8"))
+
+
+def _media_part_signature(ptype: str, part: Any) -> str:
+    """Stable signature for a media content part.
+
+    The Omni dispatcher keeps a persistent session cache. Text-only signatures
+    are not enough: the same text with different prior audio/image/video must
+    reset or the session will keep media-conditioned state from the wrong turn.
+    """
+    h = hashlib.sha256()
+    h.update(str(ptype).encode("utf-8"))
+    h.update(b"\x00")
+
+    if not isinstance(part, dict):
+        h.update(repr(part).encode("utf-8"))
+        return h.hexdigest()[:16]
+
+    if ptype in _IMAGE_TYPES:
+        src = part.get("image_url") or part.get("image") or {}
+        url = src.get("url") if isinstance(src, dict) else src
+        if isinstance(url, str):
+            if url.startswith("data:"):
+                raw, ext = _decode_data_url(url)
+                h.update(ext.encode("utf-8"))
+                h.update(b"\x00")
+                h.update(raw)
+            else:
+                h.update(_hash_local_path(Path(url)).encode("utf-8"))
+        return h.hexdigest()[:16]
+
+    if ptype in _AUDIO_TYPES:
+        src = part.get("input_audio") or part.get("audio") or {}
+        if isinstance(src, dict):
+            fmt = str(src.get("format", "")).strip().lower()
+            if fmt:
+                h.update(fmt.encode("utf-8"))
+                h.update(b"\x00")
+            b64 = src.get("data")
+            if b64:
+                h.update(base64.b64decode(b64))
+            elif isinstance(src.get("url"), str):
+                url = src["url"]
+                if url.startswith("data:"):
+                    raw, ext = _decode_data_url(url)
+                    h.update(ext.encode("utf-8"))
+                    h.update(b"\x00")
+                    h.update(raw)
+                else:
+                    h.update(_hash_local_path(Path(url)).encode("utf-8"))
+        elif isinstance(src, str):
+            h.update(_hash_local_path(Path(src)).encode("utf-8"))
+        return h.hexdigest()[:16]
+
+    if ptype in _VIDEO_TYPES:
+        src = part.get("video_url") or part.get("video") or {}
+        url = src.get("url") if isinstance(src, dict) else src
+        if isinstance(url, str):
+            if url.startswith("data:"):
+                raw, ext = _decode_data_url(url)
+                h.update(ext.encode("utf-8"))
+                h.update(b"\x00")
+                h.update(raw)
+            else:
+                h.update(_hash_local_path(Path(url)).encode("utf-8"))
+        return h.hexdigest()[:16]
+
+    h.update(json.dumps(part, sort_keys=True, default=str).encode("utf-8"))
+    return h.hexdigest()[:16]
+
+
+def _user_turn_signatures_in_order(messages: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for m in messages or []:
+        role = m.get("role") if isinstance(m, dict) else getattr(m, "role", "")
+        if role != "user":
+            continue
+        content = m.get("content") if isinstance(m, dict) else getattr(m, "content", None)
+        h = hashlib.sha256()
+        if isinstance(content, str):
+            h.update(b"text:")
+            h.update(content.encode("utf-8"))
+        elif isinstance(content, list):
+            for p in content:
+                ptype = p.get("type") if isinstance(p, dict) else getattr(p, "type", None)
+                h.update(str(ptype).encode("utf-8"))
+                h.update(b"\x00")
+                if ptype == "text":
+                    text = (p.get("text") if isinstance(p, dict) else getattr(p, "text", "")) or ""
+                    h.update(text.encode("utf-8"))
+                elif ptype in _IMAGE_TYPES or ptype in _AUDIO_TYPES or ptype in _VIDEO_TYPES:
+                    h.update(_media_part_signature(ptype, p).encode("utf-8"))
+                else:
+                    h.update(json.dumps(p, sort_keys=True, default=str).encode("utf-8"))
+                h.update(b"\x00")
+        else:
+            h.update(repr(content).encode("utf-8"))
+        out.append(h.hexdigest()[:16])
+    return out
+
+
 def _hash_user_texts(texts: List[str]) -> str:
     h = hashlib.sha256()
     for t in texts:
@@ -458,13 +570,15 @@ class OmniMultimodalDispatcher:
         with self._lock:
             self._ensure_session()
             setattr(self._session, "_vmlx_enable_thinking", bool(enable_thinking))
-            # Cumulative-prefix signature: hash all USER texts EXCLUDING the
+            # Cumulative-prefix signature: hash all USER turns EXCLUDING the
             # current (last) one. If it matches the hash we stored after the
-            # previous turn (= hash of all user texts including the one we
+            # previous turn (= hash of all user turns including the one we
             # just answered), this is the next turn of the same conversation.
-            user_texts = _user_texts_in_order(messages)
-            prefix_hash = _hash_user_texts(user_texts[:-1])
-            current_hash = _hash_user_texts(user_texts)
+            # Each turn signature includes media bytes/paths so prior audio,
+            # RADIO image, and video changes cannot reuse stale Omni state.
+            user_turns = _user_turn_signatures_in_order(messages)
+            prefix_hash = _hash_user_texts(user_turns[:-1])
+            current_hash = _hash_user_texts(user_turns)
 
             should_reset = force_reset or prefix_hash != self._last_signature
             if should_reset:
