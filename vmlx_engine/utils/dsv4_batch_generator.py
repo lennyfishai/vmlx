@@ -203,7 +203,10 @@ class DSV4BatchGenerator:
                 sampled = sampled + mx.zeros_like(sampled)
             except Exception:
                 pass
-            self._sync()
+            # Do not call _sync() here. tolist()/item() is the unavoidable
+            # scalar materialization point and will evaluate the queued graph on
+            # the active stream. An extra synchronize before it splits every
+            # decode token into another host/GPU barrier.
             return int(sampled.tolist()[0]) if hasattr(sampled, "tolist") else int(sampled.item())
 
     # ---------- helpers ----------
@@ -353,7 +356,23 @@ class DSV4BatchGenerator:
             return None
         return snapshots
 
-    def _sample(self, logits, sampler, processors, recent_tokens, generated_tokens=None):
+    def _should_capture_logprobs(self, uid: int) -> bool:
+        try:
+            from .mamba_cache import _should_capture_generation_logprobs
+
+            return bool(_should_capture_generation_logprobs(self.model, [uid])[0])
+        except Exception:
+            return False
+
+    def _sample(
+        self,
+        logits,
+        sampler,
+        processors,
+        recent_tokens,
+        generated_tokens=None,
+        capture_logprobs: bool = False,
+    ):
         """Apply logits processors then sample. logits: (1, vocab).
 
         `recent_tokens`: full prompt+generated context (used by rep_penalty
@@ -369,10 +388,21 @@ class DSV4BatchGenerator:
                 x = p(recent_tokens, x)
             except TypeError:
                 x = p(x)
-        # Convert log-probs via logsumexp normalization
-        logprobs = x - mx.logsumexp(x, axis=-1, keepdims=True)
         # Sampler
         sample_fn = sampler or self.fallback_sampler
+        if (
+            not capture_logprobs
+            and getattr(sample_fn, "_vmlx_accepts_logits", False)
+        ):
+            sampled = sample_fn(x)
+            return sampled, None
+
+        # Convert log-probs via logsumexp normalization only when the sampler
+        # actually needs normalized log-probabilities. Greedy vMLX samplers
+        # accept raw logits, and normal Chat/Responses requests do not ask for
+        # logprobs, so materializing a full-vocab log-softmax every DSV4 token
+        # is wasted decode time.
+        logprobs = x - mx.logsumexp(x, axis=-1, keepdims=True)
         sampled = sample_fn(logprobs)
         return sampled, logprobs
 
@@ -599,8 +629,8 @@ class DSV4BatchGenerator:
                         last_logits, r.sampler, r.logits_processors,
                         self._processor_context(r),
                         generated_tokens=list(r.out_tokens),
+                        capture_logprobs=self._should_capture_logprobs(r.uid),
                     )
-                    self._sync()
                     tok_id = self._sampled_token_id(sampled)
                     r.out_tokens.append(tok_id)
                     r.prompt_processed = True
@@ -629,8 +659,8 @@ class DSV4BatchGenerator:
                         last_logits, r.sampler, r.logits_processors,
                         self._processor_context(r),
                         generated_tokens=list(r.out_tokens),
+                        capture_logprobs=self._should_capture_logprobs(r.uid),
                     )
-                    self._sync()
                     tok_id = self._sampled_token_id(sampled)
                     r.out_tokens.append(tok_id)
                     r.prompt_processed = True
@@ -650,14 +680,13 @@ class DSV4BatchGenerator:
                     last_id = r.out_tokens[-1]
                     ids = mx.array([[last_id]], dtype=mx.int32)
                     logits = self.model(ids, cache=r.cache)
-                    self._sync()
                     last_logits = logits[:, -1, :]
                     sampled, logprobs = self._sample(
                         last_logits, r.sampler, r.logits_processors,
                         self._processor_context(r),
                         generated_tokens=list(r.out_tokens),
+                        capture_logprobs=self._should_capture_logprobs(r.uid),
                     )
-                    self._sync()
                     tok_id = self._sampled_token_id(sampled)
                     r.out_tokens.append(tok_id)
                     self._update_finish_reason_after_token(r, tok_id)
