@@ -64,11 +64,14 @@ import copy
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_EMBEDDED_THINK_BLOCK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 def _default_encoding_dirs() -> List[Path]:
@@ -230,6 +233,26 @@ def _resolve_mode_and_effort(
     return "chat", None
 
 
+def _drop_embedded_thinking_blocks(messages: List[Dict[str, Any]]) -> None:
+    """Strip raw think tags from prior assistant content before DSV4 encoding."""
+    last_user_idx = -1
+    for idx, msg in enumerate(messages):
+        if isinstance(msg, dict) and msg.get("role") in ("user", "developer"):
+            last_user_idx = idx
+    if last_user_idx < 0:
+        return
+
+    for idx, msg in enumerate(messages):
+        if idx >= last_user_idx or not isinstance(msg, dict):
+            continue
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str) or "<think>" not in content:
+            continue
+        msg["content"] = _EMBEDDED_THINK_BLOCK_RE.sub("", content).strip()
+
+
 def apply_chat_template(
     messages: List[Dict[str, Any]],
     *,
@@ -269,6 +292,8 @@ def apply_chat_template(
     """
     thinking_mode, effort = _resolve_mode_and_effort(enable_thinking, reasoning_effort)
     messages = copy.deepcopy(messages)
+    if drop_earlier_reasoning:
+        _drop_embedded_thinking_blocks(messages)
 
     # DSV4's bundled encoder predates the strict-template normalization used
     # by the Responses adapter. It expects OpenAI tool-call

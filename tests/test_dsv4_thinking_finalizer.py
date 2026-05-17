@@ -105,6 +105,38 @@ def test_dsv4_encoder_adapter_max_passes_through_without_env_guard(monkeypatch):
     )
 
 
+def test_dsv4_encoder_adapter_strips_embedded_prior_think_blocks(monkeypatch):
+    from vmlx_engine.loaders import dsv4_chat_encoder
+
+    captured = {}
+
+    class _Encoding:
+        def encode_messages(self, messages, **kwargs):
+            captured["messages"] = messages
+            captured["kwargs"] = kwargs
+            return "prompt"
+
+    monkeypatch.setattr(dsv4_chat_encoder, "_get_encoding", lambda **_: _Encoding())
+    messages = [
+        {"role": "user", "content": "Remember marker BLUE-FALCON-731."},
+        {
+            "role": "assistant",
+            "content": "<think>private scratch should not persist</think>OK.",
+        },
+        {"role": "user", "content": "Reply with the marker only."},
+    ]
+
+    dsv4_chat_encoder.apply_chat_template(
+        messages,
+        enable_thinking=False,
+        drop_earlier_reasoning=True,
+    )
+
+    assert captured["messages"][1]["content"] == "OK."
+    assert "<think>" in messages[1]["content"]
+    assert captured["kwargs"]["drop_thinking"] is True
+
+
 def test_dsv4_normalize_effort_ignores_raw_max_env_aliases(monkeypatch):
     from vmlx_engine.server import _normalize_dsv4_reasoning_effort
     for val in ("1", "true", "TRUE", "yes", "True", "0", "false", "no", "", "off"):
