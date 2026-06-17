@@ -35,3 +35,59 @@ Run a test:
    Only scripts/CLI proven so far.
 3. **Release integration** — register / gen-config / capability-detection wiring into the engine
    serve path; long-ctx MSA top-16 block selection is implemented but not yet long-ctx stress-tested.
+
+## Status Update (2026-06-17) — packaged app proof is PARTIAL
+
+Current live target tested: `/Applications/vMLX.app` with bundled Python
+`vmlx_engine 1.5.62`, loading
+`~/.mlxstudio/models/JANGQ-AI/MiniMax-M3-REAP40-d3-JANG_2L` through the Electron UI
+and `/v1/responses`.
+
+Source/runtime fixes landed in this lane:
+- M3 autodetect keeps paged cache off, JIT off, generic TurboQuant KV disabled,
+  native MSA cache active (`MiniMaxM3SparseCache` on sparse layers 3-59), memory-aware
+  prefix cache enabled, and SSD prompt cache enabled.
+- M3 reasoning parser handles both `<mm:think>` and fallback `<think>` tags, and
+  classifies prompt-opened no-tag deltas as reasoning.
+- M3 thinking-off no longer receives the legacy MiniMax/M2 plain `<think>` sentinel;
+  it keeps the native M3 `</mm:think>` sentinel only.
+- Responses streaming has a MiniMax-M3 visible-answer pass for the case where forced
+  reasoning consumes the first generation budget and yields no visible content.
+- Packaging guard fixed: `build-and-install.sh` now runs bundled-source parity checks,
+  `verify-bundled-python.sh` hash-gates the M3/cache/runtime files, and
+  `bundle-python.sh` removes stale setuptools `build/` artifacts before building the
+  local `vmlx` wheel. This was necessary because stale `output_collector.py` with
+  `error_message=new.error_message` shipped despite correct source.
+
+Source checks run:
+- `pytest tests/test_minimax_m3_cache_paths.py tests/test_streaming_reasoning.py tests/test_thinking_template_render.py -k 'minimax_m3 or test_minimax_m3' -q`
+  -> `16 passed, 154 deselected`.
+- `scripts/verify-bundled-python.sh` -> bundled source parity and critical imports OK.
+- `/Applications/vMLX.app` code signature -> valid on disk, satisfies Designated Requirement.
+
+Live app evidence from the rebuilt app:
+- Startup CLI included `--tool-call-parser minimax_m3`, `--reasoning-parser minimax_m3`,
+  `--cache-memory-percent 0.15`, `--enable-disk-cache`, `--disk-cache-max-gb 10`,
+  `--continuous-batching`; no `--enable-jit` and no paged-cache flag.
+- Logs: `MiniMax-M3 AUTODETECTED ... paged_cache=OFF, tq_kv=SKIP(native MSA),
+  vl_route=ON, tool_parser=minimax_m3, reasoning_parser=minimax_m3, jit=off,
+  msa_per_step_sync=ON`.
+- Logs: `Runtime cache layout` = layers 0-2 `KVCache`, layers 3-59
+  `MiniMaxM3SparseCache`.
+- Logs: `MemoryAwarePrefixCache initialized` and `Disk cache initialized`.
+- 10-turn Thinking Off UI run: no blank turn, no visible think tags, no reasoning leak,
+  no repetition loop. The formerly blank "profile options" turn returned visible content.
+- Long-context UI run: first prompt 8050 tokens; follow-up cache hits at 8045 and
+  8092 cached tokens; no blank output, no repeat loop, no engine error.
+
+Open / partial:
+- Reasoning On is still not a full semantic pass. The current app separates the
+  reasoning rail when the model emits one and no longer crashes/blanks, but one live
+  forced-thinking factual prompt returned visible content with `reasoningChars=0`
+  (the model appears to close the think rail immediately). Another live run emitted
+  reasoning but miscomputed `17 + 28` as `41`. Treat Reasoning On as PARTIAL until a
+  deterministic forced-reasoning behavior is proven or the UI contract is clarified.
+- Long-context cache reuse is structurally healthy in the tested run, but exact recall
+  was imperfect: the model remembered `DELTA-742` and both runbook rules, but missed
+  one exact required phrase. Do not call long-context QA quality fully passing.
+- This is a local ad-hoc signed app install, not a notarized release artifact.
