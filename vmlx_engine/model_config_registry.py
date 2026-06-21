@@ -568,6 +568,7 @@ class ModelConfigRegistry:
             is_zaya1_vl_family = base.family_name == "zaya1_vl"
             is_hy3_family = base.family_name == "hy_v3"
             is_minimax_family = base.family_name == "minimax"
+            is_minimax_m3_family = base.family_name == "minimax_m3"
             is_mimo_v2_family = base.family_name == "mimo_v2"
             is_gemma4_unified_text_runtime = (
                 base.family_name == "gemma4"
@@ -636,6 +637,18 @@ class ModelConfigRegistry:
                 # accepts registered parser ids. Keep the family parser
                 # canonical here so source, packaged app, and CLI agree.
                 updates["reasoning_parser"] = "minimax_m2"
+            elif is_minimax_m3_family:
+                # MiniMax-M3 emits tool calls wrapped in the literal namespace
+                # separator token ``]<]minimax[>[`` (id 200058) with <tool_call>/
+                # <invoke name=...>/<param>value</param> sections, and reasoning
+                # on the model-owned ``<mm:think>`` rail. JANG sidecars stamp
+                # these as None, leaving tools unparsed and reasoning unsplit.
+                # Bind the M3-specific parsers (both registered, both handle the
+                # NS-token / mm:think formats). Harmless no-op when a turn emits
+                # neither (e.g. REAP Coder variants that think inline).
+                updates["reasoning_parser"] = "minimax_m3"
+                updates["tool_parser"] = "minimax_m3"
+                updates["supports_native_tools"] = True
             elif is_mimo_v2_family:
                 # MiMo-V2.5 uses generic XML function calls. Current live proof
                 # shows advertised thinking can produce hidden-only output with
@@ -660,12 +673,13 @@ class ModelConfigRegistry:
                     or is_ling_family
                     or is_hy3_family
                     or is_minimax_family
+                    or is_minimax_m3_family
                     or is_mimo_v2_family
                 )
                 and base_supports_thinking is not False
             ):
                 updates["reasoning_parser"] = rp if rp != "none" else None
-            if tp is not None and not is_mimo_v2_family:
+            if tp is not None and not (is_mimo_v2_family or is_minimax_m3_family):
                 updates["tool_parser"] = tp if tp != "none" else None
             if isinstance(tin, bool) and not (
                 is_zaya_family

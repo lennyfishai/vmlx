@@ -6054,6 +6054,34 @@ class MLXMultimodalLM:
             resize_shape=kwargs.get("resize_shape"),
         )
 
+        # P0 VL stream bug: mlx_vlm.generate's module-global `generation_stream`
+        # is a Stream created on the IMPORT thread (uvicorn main); on the
+        # mllm-worker executor that handle is an invalid Stream(gpu, 0), so the
+        # forward's `with mx.stream(generation_stream)` and wired_limit's
+        # captured [generation_stream] both fail every in-forward eval (e.g.
+        # gemma4_unified _compact_prefix_rows' .tolist()) and the teardown sync.
+        #
+        # The runtime can DOUBLE-LOAD mlx_vlm.generate (the local-runtime / VL
+        # registration path), so `import mlx_vlm.generate` may resolve to a
+        # DIFFERENT module object than the one the `generate` function — and
+        # therefore generate_step + wired_limit — actually execute in. Binding
+        # via `generate.__globals__` targets the EXACT namespace that runs the
+        # generation, so a single valid on-thread stream covers the forward and
+        # wired_limit's sync with no per-request sweeps or vendored-file edits.
+        try:
+            _vs_bind = _vlm_stream()
+            if _vs_bind is not None:
+                # Bind on BOTH the generate function's own namespace and the
+                # importable module (they can be different objects when mlx_vlm
+                # double-loads), then make wired_limit teardown sync stream-safe.
+                generate.__globals__["generation_stream"] = _vs_bind
+                import mlx_vlm.generate as _mvg_bind
+                _mvg_bind.generation_stream = _vs_bind
+                from ..utils.mlx_vlm_compat import _patch_wired_limit_sync_safe
+                _patch_wired_limit_sync_safe(_mvg_bind)
+        except Exception:
+            pass
+
         result = generate(
             self.model,
             self.processor,

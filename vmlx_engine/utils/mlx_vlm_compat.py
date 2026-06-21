@@ -45,6 +45,86 @@ def apply() -> None:
     _patch_qwen35_patch_embed_layout()
     _patch_prompt_cache_rank3_trim()
     _patch_qwen35_language_mrope_none_delta()
+    _patch_wired_limit_sync_safe()
+
+
+def _patch_wired_limit_sync_safe(generate_mod=None) -> None:
+    """Make mlx_vlm.generate.wired_limit's teardown sync stream-safe.
+
+    P0 VL stream bug: ``wired_limit(model, [generation_stream])`` captures the
+    module-global ``generation_stream`` at ``with`` entry. On the simple-MLLM
+    executor (mllm-worker), that handle can be the import-thread Stream(gpu, 0)
+    while the forward actually runs on a different, on-thread stream. The
+    finally block then calls ``mx.synchronize(Stream(gpu, 0))`` on a thread
+    that has no such stream -> ``RuntimeError: There is no Stream(gpu, 0) in
+    current thread`` AFTER a perfectly good generation. Wrap wired_limit so any
+    per-stream sync that raises falls back to a plain ``mx.synchronize()`` of
+    the current thread's default stream. Idempotent.
+
+    Pass ``generate_mod`` (the live ``mlx_vlm.generate`` the forward uses) when
+    known; otherwise this imports it. We patch only that explicit module — a
+    blind ``sys.modules`` sweep is unsafe (e.g. ``torch.ops`` answers truthy to
+    ``hasattr`` for any name and other lazy modules raise on attribute access).
+    """
+    try:
+        import contextlib
+        import importlib
+        import mlx.core as mx
+    except Exception:
+        return
+
+    @contextlib.contextmanager
+    def _safe_wired_limit(model, streams=None):
+        # Reproduce upstream's wired-limit set/restore, but guard the teardown
+        # sync so a stale per-stream handle can't crash a finished generation.
+        try:
+            max_rec_size = mx.device_info()["max_recommended_working_set_size"]
+        except Exception:
+            max_rec_size = None
+        old_limit = None
+        if max_rec_size is not None:
+            try:
+                old_limit = mx.set_wired_limit(max_rec_size)
+            except Exception:
+                old_limit = None
+        try:
+            yield
+        finally:
+            if streams is not None:
+                for s in streams:
+                    try:
+                        mx.synchronize(s)
+                    except Exception:
+                        try:
+                            mx.synchronize()
+                        except Exception:
+                            pass
+            else:
+                try:
+                    mx.synchronize()
+                except Exception:
+                    pass
+            if old_limit is not None:
+                try:
+                    mx.set_wired_limit(old_limit)
+                except Exception:
+                    pass
+
+    _safe_wired_limit._vmlx_sync_safe = True
+    _targets = []
+    if generate_mod is not None:
+        _targets.append(generate_mod)
+    try:
+        _targets.append(importlib.import_module("mlx_vlm.generate"))
+    except Exception:
+        pass
+    for _mod in _targets:
+        try:
+            _wl = getattr(_mod, "wired_limit", None)
+            if _wl is not None and not getattr(_wl, "_vmlx_sync_safe", False):
+                _mod.wired_limit = _safe_wired_limit
+        except Exception:
+            pass
 
 
 class _Rank3KVTrimView:

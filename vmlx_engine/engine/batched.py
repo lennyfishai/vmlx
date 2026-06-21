@@ -284,18 +284,58 @@ class BatchedEngine(BaseEngine):
         loop = asyncio.get_running_loop()
 
         def _run_simple_mllm_chat():
-            # Rebind mlx_vlm's module-global generation_stream to a stream
-            # created on THIS mllm-worker thread so wired_limit's
-            # mx.synchronize(generation_stream) resolves (P0 VL stream bug).
+            # P0 VL stream bug: the simple-MLLM forward runs on this mllm-worker
+            # thread, but the HF processor builds pixel_values / image_position_ids
+            # OUTSIDE any mx.stream() context, so those ops get assigned the thread
+            # default stream. An unbound worker thread has no resolvable default ->
+            # later in-forward evals (e.g. gemma4_unified _compact_prefix_rows'
+            # .tolist()) raise "There is no Stream(gpu, 0) in current thread".
+            # Create one on-thread stream and bind it as this thread's default so
+            # every processor/forward op resolves. (mllm.chat() additionally binds
+            # mlx_vlm.generate.generation_stream to its own _vlm_stream(), and
+            # mlx_vlm_compat makes wired_limit's teardown sync stream-safe.)
             # Executor is single-threaded (max_workers=1), so bind once.
+            _worker_stream = None
             try:
                 import mlx.core as _mx
-                import mlx_vlm.generate as _mvg
+                # Materialize this thread's default-stream slot first; without
+                # this, set_default_stream() below does not reliably take on the
+                # mllm-worker thread (the processor's image_position_ids then land
+                # on the invalid device default stream(gpu, 0)).
+                _mx.default_stream(_mx.default_device())
                 if not getattr(_SIMPLE_MLLM_STREAM_TLS, "bound", False):
-                    _mvg.generation_stream = _mx.new_stream(_mx.default_device())
+                    _SIMPLE_MLLM_STREAM_TLS.stream = _mx.new_stream(_mx.default_device())
                     _SIMPLE_MLLM_STREAM_TLS.bound = True
+                _worker_stream = getattr(_SIMPLE_MLLM_STREAM_TLS, "stream", None)
+                if _worker_stream is not None:
+                    _mx.set_default_stream(_worker_stream)
+                    # mlx_vlm double-loads its generate module via the VL/local
+                    # runtime registration, so generation_stream lives on several
+                    # distinct module objects bound to the import thread. Rebind
+                    # every loaded copy to our on-thread stream (guarded: torch.ops
+                    # & lazy modules answer truthy / raise on attribute access) so
+                    # whichever copy runs prepare_inputs / generate_step / wired_limit
+                    # resolves on a valid stream.
+                    import sys as _sysm
+                    for _mod in list(_sysm.modules.values()):
+                        if _mod is None:
+                            continue
+                        try:
+                            if getattr(_mod, "generation_stream", None) is not None:
+                                _mod.generation_stream = _worker_stream
+                        except Exception:
+                            pass
             except Exception:
                 pass
+            if _worker_stream is not None:
+                import mlx.core as _mx2
+                with _mx2.stream(_worker_stream):
+                    return self._mllm_instance.chat(
+                        messages,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        **call_kwargs,
+                    )
             return self._mllm_instance.chat(
                 messages,
                 max_tokens=max_tokens,

@@ -342,6 +342,9 @@ else:
     print('  Already patched or structure changed: processing_utils.py sub-processor')
 "
 
+# 2b. mlx_vlm/generate.py: wired_limit teardown sync stream-safe (vMLX P0 VL fix)
+"$PYTHON" "$(cd "$(dirname "$0")" && pwd)/patch-mlx-vlm-vl-stream.py" "$SITE"
+
 # 3. transformers/models/auto/video_processing_auto.py: Null check for extractors
 #    transformers 5.2.0 bug where extractors can be None
 sed -i '' 's/if class_name in extractors:/if extractors is not None and class_name in extractors:/' \

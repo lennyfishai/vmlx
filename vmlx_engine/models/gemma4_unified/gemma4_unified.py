@@ -46,8 +46,9 @@ def _split_quantized_expert_sidecar(key: str, value: mx.array):
 
 
 def _compact_prefix_rows(features: mx.array, valid_mask: mx.array) -> mx.array:
+    mask_rows = valid_mask.tolist()
     rows = []
-    for batch_idx, row in enumerate(valid_mask.tolist()):
+    for batch_idx, row in enumerate(mask_rows):
         length = sum(bool(v) for v in row)
         if length:
             rows.append(features[batch_idx, :length])

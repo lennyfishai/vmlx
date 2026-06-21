@@ -346,6 +346,85 @@ def _supported_routed_group_size(
     return default_group_size
 
 
+def _repair_mxfp_quant_attrs(model) -> int:
+    """Force consistent (bits, group_size) on MXFP4/MXFP8 quantized modules.
+
+    The VL / SwitchGLU build path can stamp ``mode="mxfp4"`` onto routed-expert
+    QuantizedLinear modules while leaving ``bits``/``group_size`` at an ambiguous
+    affine resolution (e.g. bits=2 / group_size=64 for a real 4-bit mxfp4 weight,
+    since 2*64 == 4*32). MX format is unambiguous — mxfp4 is 4-bit, mxfp8 is
+    8-bit — so this recomputes group_size from the real packed/scales shapes and
+    pins the correct bit width. Without it, ``mx.gather_qmm`` expands the expert
+    matrix with the wrong in-features and the forward crashes (Qwen3.6 MXFP4 MoE
+    MTP/VL bundles).
+
+    SAFETY: only touches modules whose ``mode`` is ``mxfp4``/``mxfp8``. Affine
+    and MXTQ/TurboQuant modules (MiniMax-M3, JANGTQ, all standard JANG bundles)
+    are never inspected for change — this is a no-op for them.
+    """
+    import mlx.nn as _nn
+
+    fixed = 0
+
+    def _walk(module) -> None:
+        nonlocal fixed
+        for _, child in module.children().items():
+            if isinstance(child, _nn.Module):
+                candidates = [child]
+            elif isinstance(child, (list, tuple)):
+                candidates = [c for c in child if isinstance(c, _nn.Module)]
+            elif isinstance(child, dict):
+                candidates = [c for c in child.values() if isinstance(c, _nn.Module)]
+            else:
+                candidates = []
+            for c in candidates:
+                mode = str(getattr(c, "mode", "") or "")
+                if mode in ("mxfp4", "mxfp8"):
+                    w = getattr(c, "weight", None)
+                    s = getattr(c, "scales", None)
+                    if w is not None and s is not None:
+                        try:
+                            want_bits = 4 if mode == "mxfp4" else 8
+                            packed = int(w.shape[-1])
+                            scales_n = int(s.shape[-1])
+                            if scales_n:
+                                in_features = packed * (32 // want_bits)
+                                want_gs = in_features // scales_n
+                                if (
+                                    getattr(c, "bits", None) != want_bits
+                                    or getattr(c, "group_size", None) != want_gs
+                                ):
+                                    c.bits = want_bits
+                                    c.group_size = want_gs
+                                    fixed += 1
+                        except Exception:
+                            pass
+                _walk(c)
+
+    try:
+        _walk(model)
+    except Exception as _e:  # pragma: no cover - defensive
+        logger.debug("MXFP quant-attr repair skipped: %s", _e)
+        return 0
+    if fixed:
+        logger.info(
+            "  MXFP quant-attr repair: corrected %d mxfp4/mxfp8 module(s) "
+            "(bits/group_size)",
+            fixed,
+        )
+    return fixed
+
+
+def _maybe_repair_mxfp_attrs_for_result(result) -> None:
+    """Apply MXFP quant-attr repair to a ``(model, processor_or_tokenizer)`` result."""
+    try:
+        model = result[0] if isinstance(result, tuple) and result else result
+        if model is not None:
+            _repair_mxfp_quant_attrs(model)
+    except Exception as _e:  # pragma: no cover - defensive
+        logger.debug("MXFP quant-attr repair (result) skipped: %s", _e)
+
+
 def _split_gemma4_moe_quantized_expert_sidecars(
     weights: dict[str, mx.array],
 ) -> dict[str, mx.array]:
@@ -1189,12 +1268,45 @@ def _set_wired_limit_for_model(weight_files):
         # past 8 GB on first inference and the kernel SIGKILLed the
         # process. 30%-of-model is plenty for dense models too and stays
         # under max_recommended_working_set on M-series with ≥96 GB.
-        headroom = max(16 * 1024 * 1024 * 1024, int(total_bytes * 0.30))
-        target = total_bytes + headroom
-        # Cap at OS max working set (sysctl iogpu.wired_limit_mb)
+        # Reserve only a SMALL ABSOLUTE headroom for macOS/WindowServer/Metal
+        # scratch + the engine process — NOT a percentage of RAM. The old
+        # max(16%, 16GB) reserve needlessly OOM'd any model >~84% of RAM by
+        # capping the wired limit far below the model size. Default 8 GB; tune
+        # via env. We want to use near-full RAM for big models.
+        total_ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        reserve_gb = float(os.environ.get("VMLX_METAL_WIRED_RESERVE_GB", os.environ.get("VMLINUX_METAL_WIRED_RESERVE_GB", "8")))
+        reserve = int(reserve_gb * 1024 * 1024 * 1024)
+        # Optional fraction override (default 0 = absolute reserve only).
+        try:
+            _frac = float(os.environ.get("VMLX_METAL_WIRED_RESERVE_FRACTION", "0") or "0")
+            if _frac > 1:
+                _frac /= 100.0
+            if _frac > 0:
+                reserve = max(reserve, int(total_ram * min(_frac, 0.5)))
+        except Exception:
+            pass
+        ram_capped_target = max(0, total_ram - reserve)
+        # Wire the whole model + a little compute headroom, but never more than
+        # (RAM - small reserve).
+        headroom = max(4 * 1024 * 1024 * 1024, int(total_bytes * 0.10))
+        target = min(total_bytes + headroom, ram_capped_target)
+        # macOS HARD-caps the GPU wired limit at iogpu.wired_limit_mb (default
+        # ~84% of RAM). mx.set_wired_limit THROWS above max_recommended_working_set,
+        # so we MUST clamp to it or we'd wire nothing. To actually use near-full
+        # RAM for a model bigger than that cap, raise the OS cap ONCE:
+        #     sudo sysctl iogpu.wired_limit_mb=<MB>
+        # (LM Studio etc. ship a privileged helper that does this.)
         try:
             _, max_ws = get_effective_metal_working_set_bytes(mx)
             if max_ws and target > max_ws:
+                if total_bytes > max_ws:
+                    logger.warning(
+                        "  Model %.0f GB > OS GPU wired cap %.0f GB (iogpu.wired_limit_mb). "
+                        "Raise it to use near-full RAM:  sudo sysctl iogpu.wired_limit_mb=%d  "
+                        "— otherwise expect Metal OOM / heavy swap.",
+                        total_bytes / 1e9, max_ws / 1e9,
+                        int((total_ram - reserve) / 1024 / 1024),
+                    )
                 target = max_ws
         except Exception:
             pass
@@ -4291,13 +4403,17 @@ def load_jang_vlm_model(
     # v2: instant load
     if _is_v2_model(path):
         logger.info(f"JANG v2 VLM detected — loading via mmap (instant)")
-        return _load_jang_v2_vlm(
+        _vlm_result = _load_jang_v2_vlm(
             path, jang_cfg, skip_eval=skip_eval, filter_expert_keys=filter_expert_keys
         )
+        _maybe_repair_mxfp_attrs_for_result(_vlm_result)
+        return _vlm_result
 
     # v1: repack path (legacy)
     logger.info(f"JANG v1 VLM detected — repacking (this takes a few minutes)")
-    return _load_jang_v1_vlm(path, jang_cfg, config_path)
+    _vlm_result = _load_jang_v1_vlm(path, jang_cfg, config_path)
+    _maybe_repair_mxfp_attrs_for_result(_vlm_result)
+    return _vlm_result
 
 
 def load_jang_model(
